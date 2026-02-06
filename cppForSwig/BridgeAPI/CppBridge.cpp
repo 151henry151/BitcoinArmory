@@ -2222,6 +2222,58 @@ BinaryData CppBridge::setAddressTypeFor(const Wallets::WalletId& wltId,
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+BinaryData CppBridge::getPrivateKeyForAsset(const Wallets::WalletId& wltId,
+   const Wallets::AddressAccountId& accId, const BinaryDataRef& idRef,
+   MessageId msgId) const
+{
+   capnp::MallocMessageBuilder message;
+   auto fromBridge = message.initRoot<FromBridge>();
+   auto reply = fromBridge.initReply();
+   reply.setReferenceId(msgId);
+
+   try {
+      auto wltContainer = wltManager_->getWalletContainer(wltId, accId);
+      auto wltPtr = wltContainer->getWalletPtr();
+      auto wltSingle = std::dynamic_pointer_cast<
+         Wallets::AssetWallet_Single>(wltPtr);
+      if (wltSingle == nullptr) {
+         reply.setSuccess(false);
+         reply.setError("wallet is not a single-asset wallet");
+         return serializeCapnp(message);
+      }
+
+      auto assetId = Wallets::AssetId::deserializeKey(
+         idRef, PROTO_ASSETID_PREFIX);
+      auto accPtr = wltSingle->getAccountForID(assetId.getAddressAccountId());
+      auto assetPtr = accPtr->getAssetForID(assetId);
+      auto assetSingle = std::dynamic_pointer_cast<
+         Armory::Assets::AssetEntry_Single>(assetPtr);
+      if (assetSingle == nullptr || !assetSingle->hasPrivateKey()) {
+         reply.setSuccess(false);
+         reply.setError("address has no private key");
+         return serializeCapnp(message);
+      }
+
+      auto lock = wltSingle->lockDecryptedContainer();
+      const auto& privKey = wltSingle->getDecryptedPrivateKeyForAsset(
+         assetSingle);
+      reply.setSuccess(true);
+      auto walletReply = reply.initWallet();
+      walletReply.setGetPrivateKeyForAsset(capnp::Data::Builder(
+         (uint8_t*)privKey.getPtr(), privKey.getSize()));
+      return serializeCapnp(message);
+   } catch (const Wallets::Encryption::DecryptedDataContainerException& e) {
+      reply.setSuccess(false);
+      reply.setError("wallet is locked; unlock to export private keys");
+      return serializeCapnp(message);
+   } catch (const std::exception& e) {
+      reply.setSuccess(false);
+      reply.setError(e.what());
+      return serializeCapnp(message);
+   }
+}
+
+////////////////////////////////////////////////////////////////////////////////
 void CppBridge::getHeadersByHeight(
   const std::vector<unsigned>& heights, MessageId msgId)
 {

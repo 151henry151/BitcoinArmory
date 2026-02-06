@@ -418,6 +418,7 @@ struct WalletRequest {
 
       getUnlockTime                 @19: Void;
       forkWatchingOnly              @20: Types.CallbackId;
+      getPrivateKeyForAsset         @21: Data;
    }
 }
 
@@ -456,6 +457,7 @@ struct WalletReply {
       createAddressBook             @12: Types.AddressBook;
       getUnlockTime                 @13: UInt32; #unlock time in ms
       forkWatchingOnly              @14: Text; #path to new WO wallet
+      getPrivateKeyForAsset         @15: Data; #raw 32-byte private key
    }
 }
 

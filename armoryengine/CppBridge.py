@@ -835,6 +835,19 @@ class BridgeWalletWrapper(ProtoWrapper):
       return reply.wallet.getData
 
    ####
+   def getPrivateKeyForAsset(self, assetId: bytes):
+      """Return decrypted private key (32 bytes) for the given asset, or None if locked/unavailable."""
+      packet = self._getPacket()
+      packet.wallet.getPrivateKeyForAsset = assetId
+
+      fut = self.send(packet)
+      reply = fut.getVal(nothrow=True)
+      if reply is None or not reply.success:
+         return None
+      data = reply.wallet.getPrivateKeyForAsset
+      return bytes(data) if data else None
+
+   ####
    def getLedgerDelegateIdForScrAddr(self, scrAddr: bytes):
       packet = self._getPacket()
       packet.wallet.getLedgerDelegateIdForScrAddr = scrAddr

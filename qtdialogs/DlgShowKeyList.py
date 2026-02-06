@@ -10,8 +10,28 @@
 #                                                                            #
 ##############################################################################
 
+import logging
+
+from qtpy import QtCore, QtWidgets
+
 from qtdialogs.ArmoryDialog import ArmoryDialog
+from qtdialogs.qtdefines import QRichLabel, GETFONT, tightSizeNChar, USERMODE, \
+   makeLayoutFrame, VERTICAL, HORIZONTAL, STYLE_SUNKEN, STRETCH
+from qtdialogs.qtdialogs import BACKUP_TYPE_135A, BACKUP_TYPE_135C
 from armoryengine.AddressUtils import encodePrivKeyBase58
+from armoryengine.ArmoryUtils import RightNow, unixTimeToFormatStr, binary_to_hex
+from armoryengine.WalletUtils import determineWalletType, WalletTypes
+
+################################################################################
+def _deriveChaincodeFromRootKey(rootKeyBytes):
+   """Armory 1.35c chaincode: HMAC-SHA256( hash256(root), 'Derive Chaincode from Root Key' )."""
+   from armoryengine.ArmoryUtils import hash256, HMAC256
+   if hasattr(rootKeyBytes, 'toBinStr'):
+      rootKeyBytes = rootKeyBytes.toBinStr()
+   elif not isinstance(rootKeyBytes, bytes):
+      rootKeyBytes = bytes(rootKeyBytes)
+   hmacKey = hash256(rootKeyBytes)
+   return HMAC256(hmacKey, b'Derive Chaincode from Root Key')
 
 ################################################################################
 class DlgShowKeyList(ArmoryDialog):
@@ -23,7 +43,7 @@ class DlgShowKeyList(ArmoryDialog):
       self.havePriv = ((not self.wlt.useEncryption) or not (self.wlt.isLocked))
 
       wltType = determineWalletType(self.wlt, self.main)[0]
-      if wltType in (WLTTYPES.Offline, WLTTYPES.WatchOnly):
+      if wltType in (WalletTypes.Offline, WalletTypes.WatchOnly):
          self.havePriv = False
 
 
@@ -37,13 +57,18 @@ class DlgShowKeyList(ArmoryDialog):
       self.addrCopies = []
       for addr in self.wlt.getLinearAddrList(withAddrPool=True):
          self.addrCopies.append(addr.copy())
-      self.rootKeyCopy = self.wlt.addrMap['ROOT'].copy()
+      rootAddr = self.wlt.addrMap.get('ROOT') if getattr(self.wlt, 'addrMap', None) else None
+      self.rootKeyCopy = rootAddr.copy() if rootAddr and hasattr(rootAddr, 'copy') else None
 
       backupVersion = BACKUP_TYPE_135A
-      testChain = DeriveChaincodeFromRootKey(self.rootKeyCopy.binPrivKey32_Plain)
-      self.needChaincode = (not testChain == self.rootKeyCopy.chaincode)
-      if not self.needChaincode:
-         backupVersion = BACKUP_TYPE_135C
+      self.needChaincode = True
+      if self.rootKeyCopy is not None:
+         testChain = _deriveChaincodeFromRootKey(self.rootKeyCopy.binPrivKey32_Plain)
+         rootChain = self.rootKeyCopy.chaincode
+         rootChainBytes = rootChain.toBinStr() if hasattr(rootChain, 'toBinStr') else bytes(rootChain)
+         self.needChaincode = (testChain != rootChainBytes)
+         if not self.needChaincode:
+            backupVersion = BACKUP_TYPE_135C
 
       self.strDescrReg = (self.tr(
          'The textbox below shows all keys that are part of this wallet, '
@@ -108,14 +133,16 @@ class DlgShowKeyList(ArmoryDialog):
       self.chkWithAddrPool = QtWidgets.QCheckBox(self.tr('Include Unused (Address Pool)'))
       self.chkDispRootKey = QtWidgets.QCheckBox(self.tr('Include Paper Backup Root'))
       self.chkOmitSpaces = QtWidgets.QCheckBox(self.tr('Omit spaces in key data'))
-      self.chkDispRootKey.setChecked(True)
+      self.chkDispRootKey.setChecked(self.rootKeyCopy is not None)
+      if self.rootKeyCopy is None:
+         self.chkDispRootKey.setEnabled(False)
       self.chkImportedOnly.toggled.connect(self.rewriteList)
       self.chkWithAddrPool.toggled.connect(self.rewriteList)
       self.chkDispRootKey.toggled.connect(self.rewriteList)
       self.chkOmitSpaces.toggled.connect(self.rewriteList)
       # self.chkCSV = QtWidgets.QCheckBox('Display in CSV format')
 
-      if not self.havePriv:
+      if not self.havePriv and self.rootKeyCopy is not None:
          self.chkDispRootKey.setChecked(False)
          self.chkDispRootKey.setEnabled(False)
 
@@ -196,13 +223,15 @@ class DlgShowKeyList(ArmoryDialog):
             h = hex_switchEndian(h)
          return whitespace.join([h[i:i + nB] for i in range(0, len(h), nB)])
 
+      wltID = getattr(self.wlt, 'uniqueIDB58', None) or getattr(self.wlt, 'walletId', '')
+      wltName = getattr(self.wlt, 'labelName', '')
       L = []
       L.append('Created:       ' + unixTimeToFormatStr(RightNow(), self.main.getPreferredDateFormat()))
-      L.append('Wallet ID:     ' + self.wlt.uniqueIDB58)
-      L.append('Wallet Name:   ' + self.wlt.labelName)
+      L.append('Wallet ID:     ' + str(wltID))
+      L.append('Wallet Name:   ' + str(wltName))
       L.append('')
 
-      if self.chkDispRootKey.isChecked():
+      if self.chkDispRootKey.isChecked() and self.rootKeyCopy is not None:
          binPriv0 = self.rootKeyCopy.binPrivKey32_Plain.toBinStr()[:16]
          binPriv1 = self.rootKeyCopy.binPrivKey32_Plain.toBinStr()[16:]
          binChain0 = self.rootKeyCopy.chaincode.toBinStr()[:16]
@@ -239,12 +268,22 @@ class DlgShowKeyList(ArmoryDialog):
       topChain = self.wlt.getHighestUsedIndex()
       extraLbl = ''
 
+      cppWallet = getattr(self.wlt, 'cppWallet', None)
       for addr in self.addrCopies:
-         try:
-            cppAddrObj = self.wlt.cppWallet.getAddrObjByIndex(addr.chainIndex)
-         except:
-            addrIndex = self.wlt.cppWallet.getAssetIndexForAddr(addr.getAddr160())
-            cppAddrObj = self.wlt.cppWallet.getAddrObjByIndex(addrIndex)
+         cppAddrObj = None
+         if cppWallet is not None:
+            try:
+               cppAddrObj = cppWallet.getAddrObjByIndex(addr.chainIndex)
+            except Exception:
+               try:
+                  addrIndex = cppWallet.getAssetIndexForAddr(addr.getAddr160())
+                  cppAddrObj = cppWallet.getAddrObjByIndex(addrIndex)
+               except Exception:
+                  pass
+         if cppAddrObj is not None:
+            addrStr = cppAddrObj.getScrAddr()
+         else:
+            addrStr = (addr.getAddressString() if hasattr(addr, 'getAddressString') and callable(getattr(addr, 'getAddressString')) else None) or (binary_to_hex(addr.getAddr160()) if hasattr(addr, 'getAddr160') else str(addr))
 
          # Address pool
          if self.chkWithAddrPool.isChecked():
@@ -263,22 +302,46 @@ class DlgShowKeyList(ArmoryDialog):
                extraLbl = '   (Imported)'
 
          if self.chkList['AddrStr'   ].isChecked():
-            L.append(cppAddrObj.getScrAddr() + extraLbl)
+            L.append(addrStr + extraLbl)
          if self.chkList['PubKeyHash'].isChecked():
             L.append('   Hash160   : ' + fmtBin(addr.getAddr160()))
-         if self.chkList['PrivB58'   ].isChecked():
-            pB58 = encodePrivKeyBase58(addr.binPrivKey32_Plain.toBinStr())
+         binPriv = getattr(addr, 'binPrivKey32_Plain', None)
+         privStr = None
+         if binPriv is not None and hasattr(binPriv, 'toBinStr'):
+            privStr = binPriv.toBinStr()
+         elif (self.chkList['PrivB58'   ].isChecked() or self.chkList['PrivHexBE' ].isChecked()):
+            bridgeWlt = getattr(self.wlt, 'bridgeWalletObj', None)
+            assetId = getattr(addr, 'assetId', None)
+            hasPriv = getattr(addr, 'hasPrivKey', False)
+            logging.info('DlgShowKeyList: priv requested bridgeWlt=%s assetId=%s hasPrivKey=%s',
+                         bridgeWlt is not None, assetId is not None, hasPriv)
+            if bridgeWlt is not None and assetId and hasPriv:
+               try:
+                  assetIdBytes = assetId if isinstance(assetId, bytes) else bytes(assetId)
+                  privBytes = bridgeWlt.getPrivateKeyForAsset(assetIdBytes)
+                  logging.info('DlgShowKeyList: getPrivateKeyForAsset len=%s',
+                               len(privBytes) if privBytes else None)
+                  if privBytes and len(privBytes) >= 32:
+                     privStr = privBytes[:32] if len(privBytes) > 32 else privBytes
+               except Exception as e:
+                  logging.exception('DlgShowKeyList: getPrivateKeyForAsset failed')
+                  privStr = None
+         if self.chkList['PrivB58'   ].isChecked() and privStr is not None:
+            pB58 = encodePrivKeyBase58(privStr)
             pB58Stretch = whitespace.join([pB58[i:i + 6] for i in range(0, len(pB58), 6)])
             L.append('   PrivBase58: ' + pB58Stretch)
             self.havePriv = True
-         if self.chkList['PrivCrypt' ].isChecked():
-            L.append('   PrivCrypt : ' + fmtBin(addr.binPrivKey32_Encr.toBinStr()))
-         if self.chkList['PrivHexBE' ].isChecked():
-            L.append('   PrivHexBE : ' + fmtBin(addr.binPrivKey32_Plain.toBinStr()))
+         binEncr = getattr(addr, 'binPrivKey32_Encr', None)
+         if self.chkList['PrivCrypt' ].isChecked() and binEncr is not None and hasattr(binEncr, 'toBinStr'):
+            L.append('   PrivCrypt : ' + fmtBin(binEncr.toBinStr()))
+         if self.chkList['PrivHexBE' ].isChecked() and privStr is not None:
+            L.append('   PrivHexBE : ' + fmtBin(privStr))
             self.havePriv = True
-         if self.chkList['PubKey'    ].isChecked():
-            L.append('   PublicX   : ' + fmtBin(addr.binPublicKey65.toBinStr()[1:33 ]))
-            L.append('   PublicY   : ' + fmtBin(addr.binPublicKey65.toBinStr()[  33:]))
+         binPub = getattr(addr, 'binPublicKey65', None)
+         if self.chkList['PubKey'    ].isChecked() and binPub is not None and hasattr(binPub, 'toBinStr'):
+            pubBin = binPub.toBinStr()
+            L.append('   PublicX   : ' + fmtBin(pubBin[1:33 ]))
+            L.append('   PublicY   : ' + fmtBin(pubBin[  33:]))
          if self.chkList['ChainIndex'].isChecked():
             L.append('   ChainIndex: ' + str(addr.chainIndex))
 
@@ -301,7 +364,7 @@ class DlgShowKeyList(ArmoryDialog):
                return
             TheSettings.set('DNAA_WarnPrintKeys', result[1])
 
-      wltID = self.wlt.uniqueIDB58
+      wltID = getattr(self.wlt, 'uniqueIDB58', None) or getattr(self.wlt, 'walletId', 'unknown')
       fn = self.main.getFileSave(title=self.tr('Save Key List'), \
                                  ffilter=[self.tr('Text Files (*.txt)')], \
                                  defaultFilename=('keylist_%s_.txt' % wltID))
@@ -320,9 +383,12 @@ class DlgShowKeyList(ArmoryDialog):
 
 
    def cleanup(self):
-      self.rootKeyCopy.binPrivKey32_Plain.destroy()
-      for addr in self.addrCopies:
-         addr.binPrivKey32_Plain.destroy()
+      if self.rootKeyCopy is not None and hasattr(self.rootKeyCopy, 'binPrivKey32_Plain') and self.rootKeyCopy.binPrivKey32_Plain is not None:
+         self.rootKeyCopy.binPrivKey32_Plain.destroy()
+      if self.addrCopies:
+         for addr in self.addrCopies:
+            if getattr(addr, 'binPrivKey32_Plain', None) is not None:
+               addr.binPrivKey32_Plain.destroy()
       self.rootKeyCopy = None
       self.addrCopies = None
 

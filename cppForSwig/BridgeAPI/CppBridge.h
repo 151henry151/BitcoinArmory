@@ -237,6 +237,9 @@ namespace Armory
          BinaryData setAddressTypeFor(const Wallets::WalletId&,
             const Wallets::AddressAccountId&, const BinaryDataRef&,
             uint32_t, MessageId) const;
+         BinaryData getPrivateKeyForAsset(const Wallets::WalletId&,
+            const Wallets::AddressAccountId&, const BinaryDataRef&,
+            MessageId) const;
          void getBlockTimeByHeight(uint32_t, MessageId) const;
          void getFeeSchedule(const std::string&, MessageId) const;
 

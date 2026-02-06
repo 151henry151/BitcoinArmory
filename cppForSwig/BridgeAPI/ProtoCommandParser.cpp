@@ -559,6 +559,15 @@ namespace
             break;
          }
 
+         case WalletRequest::GET_PRIVATE_KEY_FOR_ASSET:
+         {
+            auto capnAssetId = request.getGetPrivateKeyForAsset();
+            BinaryDataRef assetId(capnAssetId.begin(), capnAssetId.size());
+            response = bridge->getPrivateKeyForAsset(walletId, accountId,
+               assetId, referenceId);
+            break;
+         }
+
          default:
             capnp::MallocMessageBuilder message;
             auto fromBridge = message.initRoot<FromBridge>();
