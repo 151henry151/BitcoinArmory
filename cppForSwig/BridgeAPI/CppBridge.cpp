@@ -872,7 +872,8 @@ void CppBridge::exportPrivateKeys(const Wallets::WalletId& wltId,
          }
       }
 
-      writeToClient(serializeCapnp(message));
+      auto serialized = serializeCapnp(message);
+      this->writeToClient(serialized);
       //keyPairs destroyed here; SecureBinaryData destructor zeroes memory
    };
 
