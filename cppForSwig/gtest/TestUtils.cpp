@@ -842,7 +842,7 @@ namespace DBTestUtils
       auto bdvReply = reply.getBdv();
       auto capnTxs = bdvReply.getGetTxsByHash();
       auto capnTx = capnTxs[0];
-      auto body = capnTx.getBody();
+      auto body = capnTx.getRaw();
       BinaryDataRef rawTx(body.begin(), body.end());
 
       Tx txobj(rawTx);
@@ -875,7 +875,7 @@ namespace DBTestUtils
          throw std::runtime_error(std::format("no tx for key {:x}", txKey));
       }
       auto capnTx = capnTxs[0];
-      auto body = capnTx.getBody();
+      auto body = capnTx.getRaw();
       BinaryDataRef rawTx(body.begin(), body.end());
 
       Tx txobj(rawTx);
