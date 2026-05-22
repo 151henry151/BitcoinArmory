@@ -1125,6 +1125,146 @@ namespace {
       return true;
    }
 
+
+   //-----------------------------------------------------------------------
+   // exportPrivateKeys helper — mirrors changeWalletPassphrase pattern
+   //-----------------------------------------------------------------------
+   struct ExportResult {
+      bool success = false;
+      std::string error;
+      std::vector<std::pair<BinaryData, BinaryData>> keys;
+   };
+
+   ExportResult exportPrivateKeys(
+      std::shared_ptr<Bridge::CppBridge> bridge,
+      const std::string& walletId,
+      const std::string& passphrase,
+      bool provideCorrectPass = true)
+   {
+      ExportResult out;
+      auto callbackId = Cryptography::PRNG::fortuna.generateRandom(10).toHexStr();
+      uint64_t refId = rand();
+
+      //send export request
+      {
+         capnp::MallocMessageBuilder message;
+         auto toBridge = message.initRoot<Codec::Bridge::ToBridge>();
+         toBridge.setReferenceId(refId);
+         auto request = toBridge.initWallet();
+         request.setWalletId(walletId);
+
+         auto exportReq = request.initExportPrivateKeys();
+         exportReq.setCallbackId(callbackId);
+
+         auto rawReq = serializeCapnp(message);
+         pushRequest(bridge, rawReq);
+      }
+
+      //handle unlock + cleanup notifications
+      bool run = true;
+      while (run) {
+         auto result = waitOnReply();
+         kj::ArrayPtr<const capnp::word> words(
+            reinterpret_cast<const capnp::word*>(result->data.getPtr()),
+            result->data.getSize() / sizeof(capnp::word));
+         capnp::FlatArrayMessageReader reader(words);
+
+         auto fromBridge = reader.getRoot<Codec::Bridge::FromBridge>();
+
+         //could be a reply (success or error) or a notification
+         if (fromBridge.which() == Codec::Bridge::FromBridge::REPLY) {
+            auto reply = fromBridge.getReply();
+            out.success = reply.getSuccess();
+            if (!out.success) {
+               out.error = reply.getError();
+            } else {
+               auto walletReply = reply.getWallet();
+               auto capnKeys = walletReply.getExportPrivateKeys();
+               for (auto k : capnKeys) {
+                  auto capnId  = k.getAssetId();
+                  auto capnKey = k.getPrivKey();
+                  out.keys.emplace_back(
+                     BinaryData(capnId.begin(),  capnId.size()),
+                     BinaryData(capnKey.begin(), capnKey.size()));
+               }
+            }
+            run = false;
+            continue;
+         }
+
+         if (fromBridge.which() != Codec::Bridge::FromBridge::NOTIFICATION) {
+            out.error = "unexpected message type";
+            run = false;
+            continue;
+         }
+
+         auto notif = fromBridge.getNotification();
+         if (notif.getCallbackId() != callbackId) {
+            out.error = "callback id mismatch";
+            run = false;
+            continue;
+         }
+
+         switch (notif.which()) {
+            case Codec::Bridge::Notification::UNLOCK_REQUEST:
+            {
+               capnp::MallocMessageBuilder notifMsg;
+               auto notifBridge = notifMsg.initRoot<Codec::Bridge::ToBridge>();
+               auto notifReply = notifBridge.initNotification();
+               notifReply.setCounter(notif.getCounter());
+               if (provideCorrectPass) {
+                  notifReply.setSuccess(true);
+                  notifReply.setUnlockRequest(passphrase);
+               } else {
+                  notifReply.setSuccess(false);
+               }
+               auto rawNotif = serializeCapnp(notifMsg);
+               pushRequest(bridge, rawNotif);
+               break;
+            }
+
+            case Codec::Bridge::Notification::CLEANUP:
+            {
+               run = false;
+               break;
+            }
+
+            default:
+               out.error = "unexpected notification type";
+               run = false;
+               break;
+         }
+      }
+
+      //if we ended on a cleanup, the reply should follow
+      if (!out.success && out.error.empty() && out.keys.empty()) {
+         auto result = waitOnReply();
+         kj::ArrayPtr<const capnp::word> words(
+            reinterpret_cast<const capnp::word*>(result->data.getPtr()),
+            result->data.getSize() / sizeof(capnp::word));
+         capnp::FlatArrayMessageReader reader(words);
+         auto fromBridge = reader.getRoot<Codec::Bridge::FromBridge>();
+         if (fromBridge.which() == Codec::Bridge::FromBridge::REPLY) {
+            auto reply = fromBridge.getReply();
+            out.success = reply.getSuccess();
+            if (!out.success) {
+               out.error = reply.getError();
+            } else {
+               auto walletReply = reply.getWallet();
+               auto capnKeys = walletReply.getExportPrivateKeys();
+               for (auto k : capnKeys) {
+                  auto capnId  = k.getAssetId();
+                  auto capnKey = k.getPrivKey();
+                  out.keys.emplace_back(
+                     BinaryData(capnId.begin(),  capnId.size()),
+                     BinaryData(capnKey.begin(), capnKey.size()));
+               }
+            }
+         }
+      }
+
+      return out;
+   }
    WalletData extendAddressPool(
       std::shared_ptr<Bridge::CppBridge> bridge,
       const std::string& walletId, const std::string& accountId,
@@ -2521,7 +2661,7 @@ namespace {
          auto capnHash = capnTx.getHash();
          BinaryDataRef hash{capnHash.begin(), capnHash.size()};
 
-         auto capnRaw = capnTx.getRaw();
+         auto capnRaw = capnTx.getBody().getRaw();
          BinaryDataRef raw{capnRaw.begin(), capnRaw.size()};
          result.emplace(hash, raw);
       }
@@ -5495,6 +5635,56 @@ TEST_F(BridgeWalletTests, ChangeWalletPassphrase)
       ASSERT_EQ(newLines[1], wltBackupLines[1]);
    } catch (const std::exception& e) {
       ASSERT_TRUE(false);
+   }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+TEST_F(BridgeWalletTests, ExportPrivateKeysEncrypted)
+{
+   /* 1. create an encrypted wallet */
+   std::string walletId;
+   std::string privPass{"privPass1"};
+
+   {
+      Wallets::IO::CreateWalletParams params{
+         homedir,
+         {500ms, 0, SecureBinaryData::fromString(privPass)},
+         {1ms, 0, {}},
+         nullptr, 4
+      };
+
+      std::unique_ptr<Seeds::ClearTextSeed> seed(
+         new Seeds::ClearTextSeed_Armory());
+      auto assetWlt = Wallets::AssetWallet_Single::createFromSeed(
+         std::move(seed), params);
+      walletId = assetWlt->getID();
+   }
+   ASSERT_FALSE(walletId.empty());
+
+   /* 2. load into bridge */
+   auto wltList = listWallets(bridge_);
+   ASSERT_EQ(wltList.size(), 1ULL);
+
+   auto wallets = loadWallets(bridge_);
+   ASSERT_EQ(wallets.size(), 1ULL);
+   ASSERT_EQ(wallets.begin()->first, walletId);
+
+   /* 3. export with correct passphrase — S2 */
+   {
+      auto result = exportPrivateKeys(bridge_, walletId, privPass, true);
+      ASSERT_TRUE(result.success) << "export failed: " << result.error;
+      ASSERT_GE(result.keys.size(), 1ULL);
+
+      for (const auto& kp : result.keys) {
+         EXPECT_GE(kp.first.getSize(), 1ULL);   // assetId non-empty
+         EXPECT_GE(kp.second.getSize(), 32ULL);  // privKey >= 32 bytes
+      }
+   }
+
+   /* 4. export with wrong passphrase — S3 */
+   {
+      auto result = exportPrivateKeys(bridge_, walletId, "wrongPass", false);
+      EXPECT_FALSE(result.success);
    }
 }
 

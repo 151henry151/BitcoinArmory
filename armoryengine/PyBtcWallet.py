@@ -695,6 +695,12 @@ class PyBtcWallet(object):
                addrList.append(addr)
       return addrList
 
+   def hasAnyImported(self):
+      for addr in self.addrMap.values():
+         if addr.chainIndex == -2:
+            return True
+      return False
+
    def getAddrListSortedByChainIndex(self, withRoot=False):
       """ Returns Addr160 list """
       addrList = []
